@@ -58,7 +58,17 @@ func(svc *Service) dispatch(methodName string, req reqMsg) rplMsg {
 		ad.Decode(args.Interface())
 
 		replyType := method.Type.In(2).Elem()
+		replyValue := reflect.New(replyType)
 
+		function := method.Func
+		function.Call([]reflect.Value{svc.rcvr, args.Elem(), replyValue})
+		
+		rb := new(bytes.Buffer)
+		re := gob.NewEncoder(rb)
+		re.Encode(replyValue)
+		
+
+		return rplMsg{true, rb.Bytes()}
 	}
 }
 
