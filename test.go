@@ -3,21 +3,23 @@ package main
 import (
 	"bytes"
 	"encoding/gob"
-	"fmt"
+	"log"
 	"reflect"
 	"sync"
-	"time"
+	"sync/atomic"
 )
 
-type reqMsg struct {
+
+
+type ReqMsg struct {
 	endname string
 	svcMeth string
 	argType reflect.Type
 	args []byte
-	replyChan chan rplMsg
+	replyChan chan RplMsg
 }
 
-type rplMsg struct {
+type RplMsg struct {
 	ok bool
 	reply []byte
 }
@@ -30,6 +32,94 @@ type Service struct {
 	methods map[string]reflect.Method
 }
 
+type ClientEnd struct {
+	endname string
+	ch chan ReqMsg
+	done chan struct{}
+}
+
+type Server struct {
+	mu sync.Mutex
+	services map[string]*Service
+	count int
+}
+
+type Network struct {
+	mu sync.Mutex
+	ends map[string]*ClientEnd
+	enabled map[string]bool
+	servers map[string]*Server
+	connections map[string]string
+	endCh chan ReqMsg
+	done chan struct{}
+	count int32
+}
+
+
+func MakeNetwork() *Network {
+
+	network := Network{}
+	network.ends = map[string]*ClientEnd{}
+	network.enabled = map[string]bool{}
+	network.servers = map[string]*Server{}
+	network.connections = map[string]string{}
+	network.endCh = make(chan ReqMsg)
+	network.done = make(chan struct{})
+		
+	go func(){
+		for{
+			select{
+			case req := <- network.endCh:
+				atomic.AddInt32(&network.count, 1)
+				go network.processReq(req)
+			case <- network.done:
+				return 
+			}
+		}
+
+	}()
+	return &network
+}
+
+func(network *Network) processReq(req ReqMsg){
+
+}
+
+
+func(client *ClientEnd) Call(svcMeth string, args interface{}, resp interface{}) bool { // returns if the call was successful
+	req := ReqMsg{}
+	req.endname = client.endname
+	req.svcMeth = svcMeth
+	req.argType = reflect.TypeOf(args)
+	req.replyChan = make(chan RplMsg)
+
+	qb := new(bytes.Buffer)
+	qe := gob.NewEncoder(qb)
+	qe.Encode(args)
+	req.args = qb.Bytes()
+
+	select {
+	// client.ch is a copy of the endpoint in the network
+	case client.ch <- req:
+	// if that doesnt work then that means that the network failed and should be done
+	case <-client.done:
+		return false
+	}
+
+	reply := <- req.replyChan
+
+	if reply.ok {
+		rb := bytes.NewBuffer(reply.reply)
+		re := gob.NewDecoder(rb)
+		if err := re.Decode(reply); err != nil {
+			log.Fatal("func call failed");
+		}
+		return true
+
+	} 
+
+	return false
+}
 
 func MakeService(rcvr interface{}){
 	svc := &Service{}
@@ -48,7 +138,7 @@ func MakeService(rcvr interface{}){
 	}
 }
 
-func(svc *Service) dispatch(methodName string, req reqMsg) rplMsg {
+func(svc *Service) dispatch(methodName string, req ReqMsg) RplMsg {
 	if method, ok := svc.methods[methodName]; ok {
 
 		args := reflect.New(req.argType)
@@ -68,7 +158,7 @@ func(svc *Service) dispatch(methodName string, req reqMsg) rplMsg {
 		re.Encode(replyValue)
 		
 
-		return rplMsg{true, rb.Bytes()}
+		return RplMsg{true, rb.Bytes()}
 	}
 }
 
