@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
 	"log"
 	"reflect"
 	"strings"
@@ -51,7 +52,7 @@ type Network struct {
 	ends map[string]*ClientEnd
 	enabled map[string]bool
 	servers map[string]*Server
-	connections map[string]string
+	connections map[string]interface{}
 	endCh chan ReqMsg
 	done chan struct{}
 	count int32
@@ -64,7 +65,7 @@ func MakeNetwork() *Network {
 	network.ends = map[string]*ClientEnd{}
 	network.enabled = map[string]bool{}
 	network.servers = map[string]*Server{}
-	network.connections = map[string]string{}
+	network.connections = map[string](interface{}){}
 	network.endCh = make(chan ReqMsg)
 	network.done = make(chan struct{})
 		
@@ -73,7 +74,7 @@ func MakeNetwork() *Network {
 			select{
 			case req := <- network.endCh:
 				atomic.AddInt32(&network.count, 1)
-				go network.processReq(req)
+				go network.ProcessReq(req)
 			case <- network.done:
 				return 
 			}
@@ -83,15 +84,26 @@ func MakeNetwork() *Network {
 	return &network
 }
 
-func(network *Network) processReq(req ReqMsg){
+func(network *Network) AddServer(serverName string, server *Server){
+	network.mu.Lock()
+	defer network.mu.Unlock()
+
+	network.servers[serverName] = server
+}
+
+func(network *Network) ProcessReq(req ReqMsg){
 	network.mu.Lock()
 
 	serverName, ok := network.connections[req.endname]
 	var server *Server;
+	var serverNameStr string
 	if ok {
-		server = network.servers[serverName]			
+		serverNameStr = serverName.(string)
+		server = network.servers[serverNameStr]
 	} else {
+		log.Printf("[DEBUG] ProcessReq: no connection for endname=%q (connections=%v)", req.endname, network.connections)
 		req.replyChan <- RplMsg{ok: false, reply: nil}
+		return
 	}
 
 	network.mu.Unlock()
@@ -112,21 +124,57 @@ func(network *Network) processReq(req ReqMsg){
 		case rpl = <-ech:
 			replyOk = true;
 		case <- time.After(100 * time.Millisecond):
-			
+			timeout = true
+			log.Printf("[DEBUG] ProcessReq: timeout waiting for dispatch reply (endname=%q, svcMeth=%q)", req.endname, req.svcMeth)
+			if network.IsServerDead(serverNameStr, server) {
+				go func(){
+					<-ech;
+				}()
+			}
 		}
-
 	}
 
+	serverDead := network.IsServerDead(serverNameStr, server)
+	
+	if serverDead {
+		log.Printf("[DEBUG] ProcessReq: server dead after dispatch (endname=%q, svcMeth=%q)", req.endname, req.svcMeth)
+		req.replyChan <- RplMsg{ok: false, reply: nil}
+	} else {
+		log.Printf("[DEBUG] ProcessReq: sending reply ok=%v (endname=%q, svcMeth=%q)", rpl.ok, req.endname, req.svcMeth)
+		req.replyChan <- rpl
+	}
 }
 
-func(network *Network) IsServerDead(endname string, server *Server) bool {
+func(network *Network) IsServerDead(servername string, server *Server) bool {
 	network.mu.Lock()
 	defer network.mu.Unlock()
 
-	if network.servers[endname] != server {
+	if network.servers[servername] != server {
 		return true
 	}
 	 return false
+}
+
+func(network *Network) MakeEnd(endname string) *ClientEnd {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+
+	e := &ClientEnd{}
+	e.endname  = endname
+	e.ch = network.endCh
+	e.done = network.done
+	network.ends[endname] = e
+	network.connections[endname] = nil
+
+	return e
+
+}
+
+func(network *Network) Connect(endname string, servername string){
+	network.mu.Lock()
+	defer network.mu.Unlock()
+
+	network.connections[endname] = servername
 }
 
 func(client *ClientEnd) Call(svcMeth string, args interface{}, resp interface{}) bool { // returns if the call was successful
@@ -138,7 +186,9 @@ func(client *ClientEnd) Call(svcMeth string, args interface{}, resp interface{})
 
 	qb := new(bytes.Buffer)
 	qe := gob.NewEncoder(qb)
-	qe.Encode(args)
+	if err := qe.Encode(args); err != nil {
+		log.Println("encode args failed:", err)
+	}
 	req.args = qb.Bytes()
 
 	select {
@@ -150,12 +200,13 @@ func(client *ClientEnd) Call(svcMeth string, args interface{}, resp interface{})
 	}
 
 	reply := <- req.replyChan
+	log.Printf("[DEBUG] Call: received reply ok=%v (svcMeth=%q)", reply.ok, svcMeth)
 
 	if reply.ok {
 		rb := bytes.NewBuffer(reply.reply)
 		re := gob.NewDecoder(rb)
-		if err := re.Decode(reply); err != nil {
-			log.Fatal("func call failed");
+		if err := re.Decode(resp); err != nil {
+			log.Fatal("func call failed:", err);
 		}
 		return true
 
@@ -164,7 +215,13 @@ func(client *ClientEnd) Call(svcMeth string, args interface{}, resp interface{})
 	return false
 }
 
-func MakeService(rcvr interface{}){
+func MakeServer() *Server{
+	rs := &Server{}	
+	rs.services = map[string]*Service{}
+	return rs
+}
+
+func MakeService(rcvr interface{}) *Service{
 	svc := &Service{}
 	svc.typ = reflect.TypeOf(rcvr)
 	svc.rcvr = reflect.ValueOf(rcvr)
@@ -179,11 +236,18 @@ func MakeService(rcvr interface{}){
 			svc.methods[mname] = method
 		}
 	}
+	return svc
+}
+
+func (server *Server) AddService(svc *Service) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+
+	server.services[svc.name] = svc
 }
 
 
 // server dispatch to format the service dispatch
-
 func(server *Server) dispatch(req ReqMsg) RplMsg {
 	server.mu.Lock()
 	defer server.mu.Unlock()
@@ -197,7 +261,7 @@ func(server *Server) dispatch(req ReqMsg) RplMsg {
 	if ok {
 		return service.dispatch(methName, req)
 	} else {
-
+		log.Printf("[DEBUG] server.dispatch: service %q not found (known services: %v)", serviceName, server.services)
 		return RplMsg{ok: false, reply: nil}
 	}
 
@@ -205,14 +269,16 @@ func(server *Server) dispatch(req ReqMsg) RplMsg {
 
 // service dispatch 
 func(svc *Service) dispatch(methodName string, req ReqMsg) RplMsg {
+	log.Printf("[DEBUG] svc.dispatch: service=%q methodName=%q (known methods: %v)", svc.name, methodName, svc.methods)
 	if method, ok := svc.methods[methodName]; ok {
 
 		args := reflect.New(req.argType)
 
 		ab := bytes.NewBuffer(req.args)
 		ad := gob.NewDecoder(ab)
-		ad.Decode(args.Interface())
-
+		if err := ad.Decode(args.Interface()); err != nil {
+			log.Println("decode args failed:", err)
+		}
 		replyType := method.Type.In(2).Elem()
 		replyValue := reflect.New(replyType)
 
@@ -221,25 +287,60 @@ func(svc *Service) dispatch(methodName string, req ReqMsg) RplMsg {
 		
 		rb := new(bytes.Buffer)
 		re := gob.NewEncoder(rb)
-		re.Encode(replyValue)
+		re.Encode(replyValue.Interface())
 		
 
 		return RplMsg{true, rb.Bytes()}
+	} else {
+		log.Printf("[DEBUG] svc.dispatch: method %q not found in service %q", methodName, svc.name)
+		return RplMsg{false, nil}
 	}
 }
 
 
+type Test struct{
+	
+}
 
+type AddArgs struct{
+	I int
+	J int
+}
+
+type AddRpl struct {
+	Ans int
+}
+
+func(t Test) Add(args *AddArgs, rpl *AddRpl){
+	rpl.Ans = args.I + args.J
+}
 
 
 func main(){
-	requests := make(chan Request, 100)
-	var wg sync.WaitGroup
-	go server(requests)
-	defer close(requests)
+	network := MakeNetwork()	
+	
+	server1 := MakeServer()
+	
+	tester := &Test{}
 
-	go client(requests, wg)
+	testService := MakeService(tester)
+
+	server1.AddService(testService)
+
+	network.AddServer("server1", server1)
 	
-	wg.Wait()
-	
+	endpoint := network.MakeEnd("endpoint")
+
+	network.Connect("endpoint", "server1")
+
+	args := &AddArgs{I: 1, J: 2}
+	rpl := &AddRpl{}
+
+	ok := endpoint.Call("Test.Add", args, rpl)
+
+	if ok{
+		fmt.Println(rpl.Ans)
+	} else {
+		fmt.Println("failed")
+	}
 }	
