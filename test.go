@@ -5,8 +5,10 @@ import (
 	"encoding/gob"
 	"log"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 
@@ -82,9 +84,50 @@ func MakeNetwork() *Network {
 }
 
 func(network *Network) processReq(req ReqMsg){
+	network.mu.Lock()
+
+	serverName, ok := network.connections[req.endname]
+	var server *Server;
+	if ok {
+		server = network.servers[serverName]			
+	} else {
+		req.replyChan <- RplMsg{ok: false, reply: nil}
+	}
+
+	network.mu.Unlock()
+
+	ech := make(chan RplMsg)
+	go func() {
+		ech <- server.dispatch(req)
+	}()
+		
+	var rpl RplMsg
+
+
+	replyOk := false
+	timeout := false
+
+	for !replyOk && !timeout {
+		select{
+		case rpl = <-ech:
+			replyOk = true;
+		case <- time.After(100 * time.Millisecond):
+			
+		}
+
+	}
 
 }
 
+func(network *Network) IsServerDead(endname string, server *Server) bool {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+
+	if network.servers[endname] != server {
+		return true
+	}
+	 return false
+}
 
 func(client *ClientEnd) Call(svcMeth string, args interface{}, resp interface{}) bool { // returns if the call was successful
 	req := ReqMsg{}
@@ -138,6 +181,29 @@ func MakeService(rcvr interface{}){
 	}
 }
 
+
+// server dispatch to format the service dispatch
+
+func(server *Server) dispatch(req ReqMsg) RplMsg {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+
+	dot := strings.LastIndex(req.svcMeth, ".")
+	serviceName := req.svcMeth[:dot]
+	methName := req.svcMeth[dot+1:]
+
+	service, ok := server.services[serviceName]
+
+	if ok {
+		return service.dispatch(methName, req)
+	} else {
+
+		return RplMsg{ok: false, reply: nil}
+	}
+
+}
+
+// service dispatch 
 func(svc *Service) dispatch(methodName string, req ReqMsg) RplMsg {
 	if method, ok := svc.methods[methodName]; ok {
 
@@ -161,6 +227,8 @@ func(svc *Service) dispatch(methodName string, req ReqMsg) RplMsg {
 		return RplMsg{true, rb.Bytes()}
 	}
 }
+
+
 
 
 
