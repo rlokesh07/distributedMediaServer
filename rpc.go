@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log"
+	"net/rpc"
 	"reflect"
 	"strings"
 	"sync"
@@ -284,7 +285,7 @@ func(svc *Service) dispatch(methodName string, req ReqMsg) RplMsg {
 
 		function := method.Func
 		function.Call([]reflect.Value{svc.rcvr, args.Elem(), replyValue})
-		
+	
 		rb := new(bytes.Buffer)
 		re := gob.NewEncoder(rb)
 		re.Encode(replyValue.Interface())
@@ -297,6 +298,24 @@ func(svc *Service) dispatch(methodName string, req ReqMsg) RplMsg {
 	}
 }
 
+func Call(addr string, rpcmeth string, args interface{}, rpl interface{}) bool {
+	c, erx := rpc.Dial("unix", addr)
+	if erx != nil {
+		log.Println(erx)
+		return false
+	}
+	defer c.Close()
+
+	err := c.Call(rpcmeth, args, rpl)
+	if err == nil {
+		return true
+	} else {
+		println(err)
+		return false
+	}
+
+
+}
 
 type Test struct{
 	
