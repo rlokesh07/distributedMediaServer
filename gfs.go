@@ -14,23 +14,20 @@ type Master struct {
 	mu sync.Mutex
 	filenameToChunks map[string][]string
 	chunkToServer map[string][]string
-	chunkServers map[string]string
+	chunkServers string
 	serverEndpoints map[string]*ClientEnd
+
+	lastHeard map[string]time.Time
 
 	// TODO: persister for persistant states
 
 	leases map[string]*Lease // chunkID to lease
 	versions map[string]int // chunk to version
-
+	
+	killCh chan bool
 
 	leasePeriod int // in seconds
-}
-
-type ChunkServer struct {
-	id string
-	master *ClientEnd
-	chunks []Chunk
-	leases map[string]*Lease
+	timeoutDuration int // in seconds
 }
 
 type Chunk struct {
@@ -43,6 +40,17 @@ type Lease struct {
 	chunkId string
 	chunkServerID string
 	expiration time.Time
+}
+
+func(ms *Master) service() {
+	for {
+		if <-ms.killCh{
+			return;
+		}
+		
+
+
+	}
 }
 
 
@@ -81,7 +89,35 @@ func(ms *Master) ReadState() {
 }
 
 
+func(ms *Master) BroadcastHeartbeat() {
+	for serverId, end := range ms.serverEndpoints{
+	
+		args := HeartBeatArgs{} 
+		rpl := HeartBeatRpl {}
+		ok := end.Call("ChunkServer.Heartbeat", args, rpl)
+		
 
+		now := time.Now()
+		if !ok {
+			if now.Before(ms.lastHeard[serverId].Add(time.Duration(ms.timeoutDuration))) {
+				// TODO: dead server protocol
+			}
+		} else {
+			ms.lastHeard[serverId] = now
+		}
+		
+		for chunkId, v := range rpl.versions {
+			if v != ms.versions[chunkId] {
+				
+				// TODO: garbageCollect[chunkId]
+				// TODO: replicate[chunkId]
+			
+			}
+		}
+
+	}
+
+}
 
 func(ms *Master) GetServerRead(filename string, chunkIdx int) string {
 	chunks := ms.filenameToChunks[filename]
@@ -91,6 +127,11 @@ func(ms *Master) GetServerRead(filename string, chunkIdx int) string {
 	idx := rand.Intn(len(servers))
 
 	return servers[idx]	
+}
+
+
+func(ms *Master) GetServerEndpoint(serverId string) *ClientEnd {
+	return ms.serverEndpoints[serverId]
 }
 
 
@@ -124,6 +165,31 @@ func(ms *Master) GetLease(chunkId string) *Lease{
 	
 }
 
+
+
+
+// ChunkServer
+type ChunkServer struct {
+	id string
+	master *ClientEnd
+	chunks map[string]Chunk
+	leases map[string]*Lease
+}
+
+type ReadChunkArgs struct {
+	chunkId string
+	start int
+	end int
+}
+
+type ReadChunkRpl struct {
+	data []byte
+}
+
+func(cs *ChunkServer) ReadData(args *ReadChunkArgs, rpl *ReadChunkRpl) {
+	chunk := cs.chunks[args.chunkId]
+	rpl.data = chunk.data[args.start:args.end]
+}
 
 type HeartBeatArgs struct{}
 
