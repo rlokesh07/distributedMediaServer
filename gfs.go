@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/gob"
+	"math/rand"
+	"os"
 	"sync"
 	"time"
 )
@@ -42,7 +46,52 @@ type Lease struct {
 }
 
 
+func(ms *Master) Persist() {
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(ms.versions)
+	e.Encode(ms.filenameToChunks)
+	data := w.Bytes()
+	err := os.WriteFile("masterState", data, 0644)
+	if err != nil {
+		println("persister failed")
+	}
+}
 
+func(ms *Master) ReadState() {
+	data, err := os.ReadFile("masterState")
+	if err != nil {
+		println("persister read failed")
+	}
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	var versions map[string]int
+	var chunkHandles map[string][]string
+
+	if d.Decode(&versions) != nil || d.Decode(&chunkHandles) != nil{
+		println("persister read failed")
+	} else {
+		ms.mu.Lock()
+		defer ms.mu.Unlock()
+
+		ms.versions = versions
+		ms.filenameToChunks = chunkHandles
+	}
+}
+
+
+
+
+func(ms *Master) GetServerRead(filename string, chunkIdx int) string {
+	chunks := ms.filenameToChunks[filename]
+	
+	servers := ms.chunkToServer[chunks[chunkIdx]]
+
+	idx := rand.Intn(len(servers))
+
+	return servers[idx]	
+}
 
 
 func(ms *Master) GetLease(chunkId string) *Lease{
